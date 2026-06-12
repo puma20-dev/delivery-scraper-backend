@@ -48,7 +48,7 @@ async function scrapeDoorDash(browser, restaurantName, location) {
 
     const stores = await page.evaluate(() => {
       const cards = document.querySelectorAll("a[data-anchor-id='StoreCard']");
-      return Array.from(cards).slice(0, 3).map(card => ({
+      return Array.from(cards).slice(0, 10).map(card => ({
         name: card.querySelector("span[data-anchor-id='StoreHeaderName']")?.innerText || "",
         href: card.href || "",
         deliveryFee: card.querySelector("[data-testid='DeliveryFee']")?.innerText || "",
@@ -69,7 +69,7 @@ async function scrapeDoorDash(browser, restaurantName, location) {
 
         const items = await menuPage.evaluate(() => {
           const els = document.querySelectorAll("[data-anchor-id='MenuItem']");
-          return Array.from(els).slice(0, 20).map(el => ({
+          return Array.from(els).slice(0, 50).map(el => ({
             name:  el.querySelector("[data-anchor-id='MenuItemName']")?.innerText || "",
             price: el.querySelector("[data-testid='MenuItemPrice']")?.innerText || "",
           }));
@@ -120,7 +120,7 @@ async function scrapeUberEats(browser, restaurantName, location) {
 
     const stores = await page.evaluate(() => {
       const cards = document.querySelectorAll("[data-testid='store-card']");
-      return Array.from(cards).slice(0, 3).map(card => ({
+      return Array.from(cards).slice(0, 10).map(card => ({
         name: card.querySelector("h3")?.innerText || "",
         href: card.querySelector("a")?.href || "",
         deliveryFee:  card.querySelector("[data-testid='delivery-fee']")?.innerText || "",
@@ -140,7 +140,7 @@ async function scrapeUberEats(browser, restaurantName, location) {
 
         const items = await menuPage.evaluate(() => {
           const els = document.querySelectorAll("[data-testid='menu-item']");
-          return Array.from(els).slice(0, 20).map(el => {
+          return Array.from(els).slice(0, 50).map(el => {
             const texts = el.querySelectorAll("[data-testid='rich-text']");
             return {
               name:  texts[0]?.innerText || "",
@@ -197,7 +197,7 @@ async function scrapeGrubhub(restaurantName, location) {
     const data = await res.json();
     const restaurants = data?.search_result?.results || [];
 
-    for (const r of restaurants.slice(0, 3)) {
+    for (const r of restaurants.slice(0, 10)) {
       const menuItems = [];
       const id = r.restaurant_id;
 
