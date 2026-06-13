@@ -1,5 +1,5 @@
-const express  = require("express");
-const cors     = require("cors");
+const express      = require("express");
+const cors         = require("cors");
 const { chromium } = require("playwright");
 
 const app  = express();
@@ -18,19 +18,62 @@ function getCached(key) {
 }
 function setCached(key, data) { cache.set(key, { data, ts: Date.now() }); }
 
-// ── Parse "$3.99 delivery" → 3.99 ───────────────────────────
 function parsePrice(str) {
   if (!str) return null;
   const m = String(str).match(/[\d.]+/);
   return m ? parseFloat(m[0]) : null;
 }
 
-// ── Health check ─────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "DishPrice scraper is running" });
+  res.json({ status: "ok", message: "DishPrice scraper running" });
 });
 
-// ── DoorDash scraper ─────────────────────────────────────────
+
+// ============================================================
+// STEP 0 — Search Google Maps for nearby restaurants
+// Returns list of real nearby places matching the query
+// ============================================================
+async function searchGoogleMaps(browser, restaurantName, location) {
+  const page = await browser.newPage();
+  const results = [];
+
+  try {
+    await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,mp4}", r => r.abort());
+
+    const query = `${restaurantName} near ${location}`;
+    const url   = `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
+
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    // Extract restaurant names, addresses, ratings from Maps results
+    const places = await page.evaluate(() => {
+      const items = document.querySelectorAll("[role='feed'] > div");
+      return Array.from(items).slice(0, 10).map(item => {
+        const name    = item.querySelector(".fontHeadlineSmall, [jstcache] .fontBodyMedium")?.innerText;
+        const address = item.querySelector(".fontBodyMedium span:last-child")?.innerText;
+        const rating  = item.querySelector(".MW4etd")?.innerText;
+        const reviews = item.querySelector(".UY7F9")?.innerText;
+        return { name, address, rating, reviews };
+      }).filter(p => p.name);
+    });
+
+    results.push(...places);
+    console.log(`[Maps] Found ${results.length} places for "${restaurantName}" near ${location}`);
+
+  } catch (e) {
+    console.error("[Maps] error:", e.message);
+  } finally {
+    await page.close();
+  }
+
+  return results;
+}
+
+
+// ============================================================
+// STEP 1 — DoorDash scraper
+// ============================================================
 async function scrapeDoorDash(browser, restaurantName, location) {
   const results = [];
   const page    = await browser.newPage();
@@ -48,8 +91,8 @@ async function scrapeDoorDash(browser, restaurantName, location) {
       Array.from(document.querySelectorAll("a[data-anchor-id='StoreCard']"))
         .slice(0, 10)
         .map(c => ({
-          name: c.querySelector("span[data-anchor-id='StoreHeaderName']")?.innerText || "",
-          href: c.href || "",
+          name:         c.querySelector("span[data-anchor-id='StoreHeaderName']")?.innerText || "",
+          href:         c.href || "",
           deliveryFee:  c.querySelector("[data-testid='DeliveryFee']")?.innerText || "",
           deliveryTime: c.querySelector("[data-testid='DeliveryEta']")?.innerText || "",
           rating:       c.querySelector("[aria-label*='Star Rating']")?.innerText || "",
@@ -92,7 +135,10 @@ async function scrapeDoorDash(browser, restaurantName, location) {
   return results;
 }
 
-// ── Uber Eats scraper ────────────────────────────────────────
+
+// ============================================================
+// STEP 2 — Uber Eats scraper
+// ============================================================
 async function scrapeUberEats(browser, restaurantName, location) {
   const results = [];
   const page    = await browser.newPage();
@@ -154,7 +200,10 @@ async function scrapeUberEats(browser, restaurantName, location) {
   return results;
 }
 
-// ── Grubhub scraper ──────────────────────────────────────────
+
+// ============================================================
+// STEP 3 — Grubhub scraper
+// ============================================================
 async function scrapeGrubhub(restaurantName, location) {
   const results = [];
   try {
@@ -173,7 +222,7 @@ async function scrapeGrubhub(restaurantName, location) {
       const menuItems = [];
       if (r.restaurant_id) {
         try {
-          const mr   = await fetch(`https://api-gtm.grubhub.com/restaurants/${r.restaurant_id}?hideHateos=true`, {
+          const mr = await fetch(`https://api-gtm.grubhub.com/restaurants/${r.restaurant_id}?hideHateos=true`, {
             headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.grubhub.com/" }
           });
           const md   = await mr.json();
@@ -200,7 +249,10 @@ async function scrapeGrubhub(restaurantName, location) {
   return results;
 }
 
-// ── Price comparison engine ──────────────────────────────────
+
+// ============================================================
+// Price comparison engine
+// ============================================================
 function comparePrices(restaurantName, itemName, allResults) {
   const norm  = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const tRest = norm(restaurantName);
@@ -210,27 +262,28 @@ function comparePrices(restaurantName, itemName, allResults) {
   for (const platformResults of allResults) {
     for (const restaurant of platformResults) {
       if (!norm(restaurant.restaurant).includes(tRest)) continue;
+
+      let added = false;
       for (const item of restaurant.menu || []) {
         if (itemName && !norm(item.name).includes(tItem)) continue;
-        const itemPrice = item.price  || 0;
+        const itemPrice = item.price || 0;
         const delFee    = restaurant.deliveryFee || 0;
-        const total     = Math.round((itemPrice + delFee) * 100) / 100;
         matches.push({
           platform:      restaurant.platform,
           restaurant:    restaurant.restaurant,
           item:          item.name,
           itemPrice,
           deliveryFee:   delFee,
-          totalEstimate: total,
+          totalEstimate: Math.round((itemPrice + delFee) * 100) / 100,
           deliveryTime:  restaurant.deliveryTime,
           rating:        restaurant.rating,
           orderUrl:      restaurant.orderUrl,
           appUrl:        restaurant.appUrl,
         });
+        added = true;
       }
 
-      // If no item specified or no menu items matched, still return restaurant info
-      if (!itemName || restaurant.menu.length === 0) {
+      if (!added) {
         matches.push({
           platform:      restaurant.platform,
           restaurant:    restaurant.restaurant,
@@ -257,12 +310,18 @@ function comparePrices(restaurantName, itemName, allResults) {
   return { found: true, bestDeal: matches[0].platform, savings, results: matches };
 }
 
-// ── POST /api/compare ────────────────────────────────────────
-app.post("/api/compare", async (req, res) => {
-  const { restaurantName, itemName = "", location = "Houston, TX" } = req.body;
-  if (!restaurantName) return res.status(400).json({ error: "restaurantName is required" });
 
-  const cacheKey = `${restaurantName}|${itemName}|${location}`;
+// ============================================================
+// GET /api/nearby — Search Google Maps for nearby restaurants
+// Query: ?name=Chipotle&location=Houston,TX&lat=29.76&lng=-95.36
+// ============================================================
+app.get("/api/nearby", async (req, res) => {
+  const { name, location = "Houston, TX", lat, lng } = req.query;
+  if (!name) return res.status(400).json({ error: "name is required" });
+
+  // Use coordinates if provided for more accurate results
+  const searchLocation = lat && lng ? `${lat},${lng}` : location;
+  const cacheKey = `nearby|${name}|${searchLocation}`;
   const cached   = getCached(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
@@ -273,15 +332,63 @@ app.post("/api/compare", async (req, res) => {
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const [dd, ue, gh] = await Promise.all([
-      scrapeDoorDash(browser, restaurantName, location),
-      scrapeUberEats(browser, restaurantName, location),
-      scrapeGrubhub(restaurantName, location),
-    ]);
-
-    const result = comparePrices(restaurantName, itemName, [dd, ue, gh]);
+    const places = await searchGoogleMaps(browser, name, searchLocation);
+    const result = { found: places.length > 0, places };
     setCached(cacheKey, result);
     res.json(result);
+
+  } catch (err) {
+    console.error("Nearby error:", err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
+
+// ============================================================
+// POST /api/compare — Full price comparison with Maps lookup
+// Body: { restaurantName, itemName, location, lat, lng }
+// ============================================================
+app.post("/api/compare", async (req, res) => {
+  const { restaurantName, itemName = "", location = "Houston, TX", lat, lng } = req.body;
+  if (!restaurantName) return res.status(400).json({ error: "restaurantName is required" });
+
+  const searchLocation = lat && lng ? `${lat},${lng}` : location;
+  const cacheKey = `${restaurantName}|${itemName}|${searchLocation}`;
+  const cached   = getCached(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    });
+
+    // Step 1: Find nearby locations on Google Maps first
+    const nearbyPlaces = await searchGoogleMaps(browser, restaurantName, searchLocation);
+    console.log(`[Compare] Maps found: ${nearbyPlaces.map(p => p.name).join(", ")}`);
+
+    // Step 2: Use the closest Maps result name for more accurate platform searches
+    const refinedName = nearbyPlaces.length > 0 ? nearbyPlaces[0].name : restaurantName;
+
+    // Step 3: Scrape all 3 platforms simultaneously
+    const [dd, ue, gh] = await Promise.all([
+      scrapeDoorDash(browser, refinedName, searchLocation),
+      scrapeUberEats(browser, refinedName, searchLocation),
+      scrapeGrubhub(refinedName, searchLocation),
+    ]);
+
+    const result = {
+      ...comparePrices(refinedName, itemName, [dd, ue, gh]),
+      nearbyPlaces,       // send Maps results to frontend too
+      refinedName,        // what name was actually searched
+    };
+
+    setCached(cacheKey, result);
+    res.json(result);
+
   } catch (err) {
     console.error("Compare error:", err);
     res.status(500).json({ error: err.message });
@@ -290,7 +397,10 @@ app.post("/api/compare", async (req, res) => {
   }
 });
 
-// ── GET /api/restaurants ─────────────────────────────────────
+
+// ============================================================
+// GET /api/restaurants — Raw platform results
+// ============================================================
 app.get("/api/restaurants", async (req, res) => {
   const { name, location = "Houston, TX" } = req.query;
   if (!name) return res.status(400).json({ error: "name is required" });
@@ -314,4 +424,5 @@ app.get("/api/restaurants", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`DishPrice scraper running on port ${PORT}`));
+
+app.listen(PORT, () => console.log(`DishPrice running on port ${PORT}`));
