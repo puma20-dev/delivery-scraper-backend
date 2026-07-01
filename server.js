@@ -17,117 +17,65 @@ function getCached(key) {
   return null;
 }
 function setCached(key, data) { cache.set(key, { data, ts: Date.now() }); }
-
 function parsePrice(str) {
   if (!str) return null;
   const m = String(str).match(/[\d.]+/);
   return m ? parseFloat(m[0]) : null;
 }
 
-app.get("/", (req, res) => {
-  res.json({ status: "ok", message: "DishPrice scraper running" });
-});
+app.get("/", (req, res) => res.json({ status: "ok", message: "DishPrice running" }));
 
 
 // ============================================================
-// STEP 0 — Search Google Maps for nearby restaurants
-// Returns list of real nearby places matching the query
+// GET ALL restaurants near a location from DoorDash
+// Uses DoorDash's browse-by-location page, not search
 // ============================================================
-async function searchGoogleMaps(browser, restaurantName, location) {
-  const page = await browser.newPage();
-  const results = [];
-
-  try {
-    await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,mp4}", r => r.abort());
-
-    const query = `${restaurantName} near ${location}`;
-    const url   = `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
-
-    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(3000);
-
-    // Extract restaurant names, addresses, ratings from Maps results
-    const places = await page.evaluate(() => {
-      const items = document.querySelectorAll("[role='feed'] > div");
-      return Array.from(items).slice(0, 10).map(item => {
-        const name    = item.querySelector(".fontHeadlineSmall, [jstcache] .fontBodyMedium")?.innerText;
-        const address = item.querySelector(".fontBodyMedium span:last-child")?.innerText;
-        const rating  = item.querySelector(".MW4etd")?.innerText;
-        const reviews = item.querySelector(".UY7F9")?.innerText;
-        return { name, address, rating, reviews };
-      }).filter(p => p.name);
-    });
-
-    results.push(...places);
-    console.log(`[Maps] Found ${results.length} places for "${restaurantName}" near ${location}`);
-
-  } catch (e) {
-    console.error("[Maps] error:", e.message);
-  } finally {
-    await page.close();
-  }
-
-  return results;
-}
-
-
-// ============================================================
-// STEP 1 — DoorDash scraper
-// ============================================================
-async function scrapeDoorDash(browser, restaurantName, location) {
+async function getAllDoorDash(browser, lat, lng, query = "") {
   const results = [];
   const page    = await browser.newPage();
   try {
-    await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
     await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,mp4}", r => r.abort());
 
-    await page.goto(
-      `https://www.doordash.com/search/store/${encodeURIComponent(restaurantName)}/`,
-      { waitUntil: "networkidle", timeout: 30000 }
-    );
-    await page.waitForTimeout(2000);
+    // DoorDash home feed uses lat/lng to show nearby restaurants
+    const url = query
+      ? `https://www.doordash.com/search/store/${encodeURIComponent(query)}/?lat=${lat}&lng=${lng}`
+      : `https://www.doordash.com/?lat=${lat}&lng=${lng}`;
+
+    await page.goto(url, { waitUntil: "networkidle", timeout: 35000 });
+    await page.waitForTimeout(3000);
+
+    // Scroll to load more restaurants
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(() => window.scrollBy(0, 1200));
+      await page.waitForTimeout(1000);
+    }
 
     const stores = await page.evaluate(() =>
       Array.from(document.querySelectorAll("a[data-anchor-id='StoreCard']"))
-        .slice(0, 10)
         .map(c => ({
-          name:         c.querySelector("span[data-anchor-id='StoreHeaderName']")?.innerText || "",
+          name:         c.querySelector("span[data-anchor-id='StoreHeaderName']")?.innerText?.trim() || "",
           href:         c.href || "",
           deliveryFee:  c.querySelector("[data-testid='DeliveryFee']")?.innerText || "",
           deliveryTime: c.querySelector("[data-testid='DeliveryEta']")?.innerText || "",
           rating:       c.querySelector("[aria-label*='Star Rating']")?.innerText || "",
+          cuisine:      c.querySelector("[data-testid='StoreCuisine']")?.innerText || "",
         }))
+        .filter(s => s.name && s.href)
     );
 
-    for (const store of stores) {
-      if (!store.href) continue;
-      const menuItems = [];
-      try {
-        const mp = await browser.newPage();
-        await mp.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2}", r => r.abort());
-        await mp.goto(store.href, { waitUntil: "networkidle", timeout: 25000 });
-        await mp.waitForTimeout(2000);
-        const items = await mp.evaluate(() =>
-          Array.from(document.querySelectorAll("[data-anchor-id='MenuItem']"))
-            .slice(0, 50)
-            .map(el => ({
-              name:  el.querySelector("[data-anchor-id='MenuItemName']")?.innerText || "",
-              price: el.querySelector("[data-testid='MenuItemPrice']")?.innerText || "",
-            }))
-        );
-        items.forEach(i => { if (i.name) menuItems.push({ name: i.name, price: parsePrice(i.price) }); });
-        await mp.close();
-      } catch (e) { console.error("[DD] menu:", e.message); }
+    console.log(`[DoorDash] Found ${stores.length} restaurants`);
 
+    for (const store of stores.slice(0, 30)) {
       results.push({
         platform:     "DoorDash",
         restaurant:   store.name,
+        cuisine:      store.cuisine,
         deliveryFee:  parsePrice(store.deliveryFee),
         deliveryTime: store.deliveryTime,
         rating:       store.rating,
-        menu:         menuItems,
-        orderUrl:     `https://www.doordash.com/search/store/${encodeURIComponent(store.name || restaurantName)}/`,
-        appUrl:       `doordash://search?query=${encodeURIComponent(store.name || restaurantName)}`,
+        menu:         [],
+        orderUrl:     store.href,
+        appUrl:       `doordash://store/${encodeURIComponent(store.name)}`,
       });
     }
   } catch (e) { console.error("[DD] error:", e.message); }
@@ -137,62 +85,55 @@ async function scrapeDoorDash(browser, restaurantName, location) {
 
 
 // ============================================================
-// STEP 2 — Uber Eats scraper
+// GET ALL restaurants near a location from Uber Eats
 // ============================================================
-async function scrapeUberEats(browser, restaurantName, location) {
+async function getAllUberEats(browser, lat, lng, query = "") {
   const results = [];
   const page    = await browser.newPage();
   try {
-    await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2}", r => r.abort());
-    await page.goto(
-      `https://www.ubereats.com/feed?q=${encodeURIComponent(restaurantName)}&diningMode=DELIVERY`,
-      { waitUntil: "networkidle", timeout: 30000 }
-    );
+    await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,mp4}", r => r.abort());
+
+    const url = query
+      ? `https://www.ubereats.com/feed?diningMode=DELIVERY&pl=JTdCJTIybGF0aXR1ZGUlMjIlM0Eke2xhdH0lMkMlMjJsb25naXR1ZGUlMjIlM0Eke2xuZ30lN0Q%3D&q=${encodeURIComponent(query)}`
+      : `https://www.ubereats.com/feed?diningMode=DELIVERY&pl=JTdCJTIybGF0aXR1ZGUlMjIlM0Eke2xhdH0lMkMlMjJsb25naXR1ZGUlMjIlM0Eke2xuZ30lN0Q%3D`;
+
+    // Use a location-encoded URL
+    const locationUrl = `https://www.ubereats.com/feed?diningMode=DELIVERY&userLat=${lat}&userLng=${lng}${query ? `&q=${encodeURIComponent(query)}` : ""}`;
+
+    await page.goto(locationUrl, { waitUntil: "networkidle", timeout: 35000 });
     await page.waitForTimeout(3000);
+
+    // Scroll to load more
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(() => window.scrollBy(0, 1200));
+      await page.waitForTimeout(1000);
+    }
 
     const stores = await page.evaluate(() =>
       Array.from(document.querySelectorAll("[data-testid='store-card']"))
-        .slice(0, 10)
         .map(c => ({
-          name:         c.querySelector("h3")?.innerText || "",
+          name:         c.querySelector("h3")?.innerText?.trim() || "",
           href:         c.querySelector("a")?.href || "",
           deliveryFee:  c.querySelector("[data-testid='delivery-fee']")?.innerText || "",
           deliveryTime: c.querySelector("[data-testid='eta-label']")?.innerText || "",
+          tag:          c.querySelector("[data-testid='tag-text']")?.innerText || "",
         }))
+        .filter(s => s.name && s.href)
     );
 
-    for (const store of stores) {
-      if (!store.href) continue;
-      const menuItems = [];
-      try {
-        const mp = await browser.newPage();
-        await mp.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2}", r => r.abort());
-        await mp.goto(store.href, { waitUntil: "networkidle", timeout: 25000 });
-        await mp.waitForTimeout(2000);
-        const items = await mp.evaluate(() =>
-          Array.from(document.querySelectorAll("[data-testid='menu-item']"))
-            .slice(0, 50)
-            .map(el => {
-              const texts = el.querySelectorAll("[data-testid='rich-text']");
-              return {
-                name:  texts[0]?.innerText || "",
-                price: el.querySelector("[data-testid='menu-item-price']")?.innerText || "",
-              };
-            })
-        );
-        items.forEach(i => { if (i.name) menuItems.push({ name: i.name, price: parsePrice(i.price) }); });
-        await mp.close();
-      } catch (e) { console.error("[UE] menu:", e.message); }
+    console.log(`[UberEats] Found ${stores.length} restaurants`);
 
+    for (const store of stores.slice(0, 30)) {
       results.push({
         platform:     "Uber Eats",
         restaurant:   store.name,
+        cuisine:      store.tag,
         deliveryFee:  parsePrice(store.deliveryFee),
         deliveryTime: store.deliveryTime,
         rating:       null,
-        menu:         menuItems,
-        orderUrl:     `https://www.ubereats.com/search?q=${encodeURIComponent(store.name || restaurantName)}`,
-        appUrl:       `ubereats://search?q=${encodeURIComponent(store.name || restaurantName)}`,
+        menu:         [],
+        orderUrl:     store.href,
+        appUrl:       `ubereats://search?q=${encodeURIComponent(store.name)}`,
       });
     }
   } catch (e) { console.error("[UE] error:", e.message); }
@@ -202,12 +143,13 @@ async function scrapeUberEats(browser, restaurantName, location) {
 
 
 // ============================================================
-// STEP 3 — Grubhub scraper
+// GET ALL restaurants near a location from Grubhub
 // ============================================================
-async function scrapeGrubhub(restaurantName, location) {
+async function getAllGrubhub(lat, lng, query = "") {
   const results = [];
   try {
-    const url = `https://api-gtm.grubhub.com/restaurants/search?orderMethod=standard&locationMode=DELIVERY&pageSize=10&hideHateos=true&queryText=${encodeURIComponent(restaurantName)}&location=${encodeURIComponent(location)}&sortSetId=umami`;
+    const url = `https://api-gtm.grubhub.com/restaurants/search?orderMethod=standard&locationMode=DELIVERY&facetSet=umamiV2&pageSize=40&hideHateos=true&queryText=${encodeURIComponent(query || "food")}&latitude=${lat}&longitude=${lng}&sortSetId=umami&sponsoredSize=3&countOmittedRestaurants=true`;
+
     const res  = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -217,32 +159,19 @@ async function scrapeGrubhub(restaurantName, location) {
     });
     const data        = await res.json();
     const restaurants = data?.search_result?.results || [];
+    console.log(`[Grubhub] Found ${restaurants.length} restaurants`);
 
-    for (const r of restaurants.slice(0, 10)) {
-      const menuItems = [];
-      if (r.restaurant_id) {
-        try {
-          const mr = await fetch(`https://api-gtm.grubhub.com/restaurants/${r.restaurant_id}?hideHateos=true`, {
-            headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.grubhub.com/" }
-          });
-          const md   = await mr.json();
-          const list = md?.restaurant?.menu_item_list || [];
-          list.forEach(cat => {
-            (cat.choice_list || []).forEach(item => {
-              menuItems.push({ name: item.name, price: item.price ? item.price / 100 : null });
-            });
-          });
-        } catch (e) { console.error("[GH] menu:", e.message); }
-      }
+    for (const r of restaurants) {
       results.push({
         platform:     "Grubhub",
         restaurant:   r.name,
+        cuisine:      r.cuisines?.[0] || "",
         deliveryFee:  r.delivery_fee ? r.delivery_fee / 100 : null,
         deliveryTime: r.estimated_delivery_time,
         rating:       r.ratings?.actual_rating_value || null,
-        menu:         menuItems,
-        orderUrl:     `https://www.grubhub.com/search?queryText=${encodeURIComponent(r.name || restaurantName)}`,
-        appUrl:       `grubhub://search?query=${encodeURIComponent(r.name || restaurantName)}`,
+        menu:         [],
+        orderUrl:     `https://www.grubhub.com/restaurant/${r.restaurant_id}`,
+        appUrl:       `grubhub://restaurant/${r.restaurant_id}`,
       });
     }
   } catch (e) { console.error("[GH] error:", e.message); }
@@ -251,77 +180,60 @@ async function scrapeGrubhub(restaurantName, location) {
 
 
 // ============================================================
-// Price comparison engine
+// GET menu for a specific restaurant on a specific platform
 // ============================================================
-function comparePrices(restaurantName, itemName, allResults) {
-  const norm  = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  const tRest = norm(restaurantName);
-  const tItem = norm(itemName);
-  const matches = [];
+async function getMenu(browser, platform, orderUrl, restaurantName) {
+  const menuItems = [];
+  const page      = await browser.newPage();
+  try {
+    await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,mp4}", r => r.abort());
+    await page.goto(orderUrl, { waitUntil: "networkidle", timeout: 25000 });
+    await page.waitForTimeout(2000);
 
-  for (const platformResults of allResults) {
-    for (const restaurant of platformResults) {
-      if (!norm(restaurant.restaurant).includes(tRest)) continue;
+    if (platform === "DoorDash") {
+      const items = await page.evaluate(() =>
+        Array.from(document.querySelectorAll("[data-anchor-id='MenuItem']"))
+          .slice(0, 50)
+          .map(el => ({
+            name:  el.querySelector("[data-anchor-id='MenuItemName']")?.innerText || "",
+            price: el.querySelector("[data-testid='MenuItemPrice']")?.innerText || "",
+          }))
+      );
+      items.forEach(i => { if (i.name) menuItems.push({ name: i.name, price: parsePrice(i.price) }); });
 
-      let added = false;
-      for (const item of restaurant.menu || []) {
-        if (itemName && !norm(item.name).includes(tItem)) continue;
-        const itemPrice = item.price || 0;
-        const delFee    = restaurant.deliveryFee || 0;
-        matches.push({
-          platform:      restaurant.platform,
-          restaurant:    restaurant.restaurant,
-          item:          item.name,
-          itemPrice,
-          deliveryFee:   delFee,
-          totalEstimate: Math.round((itemPrice + delFee) * 100) / 100,
-          deliveryTime:  restaurant.deliveryTime,
-          rating:        restaurant.rating,
-          orderUrl:      restaurant.orderUrl,
-          appUrl:        restaurant.appUrl,
-        });
-        added = true;
-      }
-
-      if (!added) {
-        matches.push({
-          platform:      restaurant.platform,
-          restaurant:    restaurant.restaurant,
-          item:          null,
-          itemPrice:     null,
-          deliveryFee:   restaurant.deliveryFee || 0,
-          totalEstimate: restaurant.deliveryFee || 0,
-          deliveryTime:  restaurant.deliveryTime,
-          rating:        restaurant.rating,
-          orderUrl:      restaurant.orderUrl,
-          appUrl:        restaurant.appUrl,
-        });
-      }
+    } else if (platform === "Uber Eats") {
+      const items = await page.evaluate(() =>
+        Array.from(document.querySelectorAll("[data-testid='menu-item']"))
+          .slice(0, 50)
+          .map(el => {
+            const texts = el.querySelectorAll("[data-testid='rich-text']");
+            return {
+              name:  texts[0]?.innerText || "",
+              price: el.querySelector("[data-testid='menu-item-price']")?.innerText || "",
+            };
+          })
+      );
+      items.forEach(i => { if (i.name) menuItems.push({ name: i.name, price: parsePrice(i.price) }); });
     }
-  }
-
-  matches.sort((a, b) => a.totalEstimate - b.totalEstimate);
-  if (!matches.length) return { found: false, results: [] };
-
-  const savings = Math.round(
-    (matches[matches.length - 1].totalEstimate - matches[0].totalEstimate) * 100
-  ) / 100;
-
-  return { found: true, bestDeal: matches[0].platform, savings, results: matches };
+  } catch (e) { console.error(`[Menu] error for ${restaurantName}:`, e.message); }
+  finally { await page.close(); }
+  return menuItems;
 }
 
 
 // ============================================================
-// GET /api/nearby — Search Google Maps for nearby restaurants
-// Query: ?name=Chipotle&location=Houston,TX&lat=29.76&lng=-95.36
+// GET /api/nearby-all
+// Returns ALL restaurants within ~20 miles using GPS coords
+// Query: ?lat=29.76&lng=-95.36&query=pizza (query optional)
 // ============================================================
-app.get("/api/nearby", async (req, res) => {
-  const { name, location = "Houston, TX", lat, lng } = req.query;
-  if (!name) return res.status(400).json({ error: "name is required" });
+app.get("/api/nearby-all", async (req, res) => {
+  const { lat, lng, query = "", location = "Houston, TX" } = req.query;
 
-  // Use coordinates if provided for more accurate results
-  const searchLocation = lat && lng ? `${lat},${lng}` : location;
-  const cacheKey = `nearby|${name}|${searchLocation}`;
+  if (!lat || !lng) {
+    return res.status(400).json({ error: "lat and lng are required" });
+  }
+
+  const cacheKey = `nearby-all|${lat}|${lng}|${query}`;
   const cached   = getCached(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
@@ -332,13 +244,50 @@ app.get("/api/nearby", async (req, res) => {
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
 
-    const places = await searchGoogleMaps(browser, name, searchLocation);
-    const result = { found: places.length > 0, places };
+    // Get all restaurants from all 3 platforms simultaneously
+    const [dd, ue, gh] = await Promise.all([
+      getAllDoorDash(browser, lat, lng, query),
+      getAllUberEats(browser, lat, lng, query),
+      getAllGrubhub(lat, lng, query),
+    ]);
+
+    // Merge and deduplicate by restaurant name
+    const allRestaurants = {};
+
+    [...dd, ...ue, ...gh].forEach(r => {
+      const key = r.restaurant.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!allRestaurants[key]) {
+        allRestaurants[key] = {
+          name:      r.restaurant,
+          cuisine:   r.cuisine,
+          platforms: [],
+        };
+      }
+      allRestaurants[key].platforms.push({
+        platform:     r.platform,
+        deliveryFee:  r.deliveryFee,
+        deliveryTime: r.deliveryTime,
+        rating:       r.rating,
+        orderUrl:     r.orderUrl,
+        appUrl:       r.appUrl,
+      });
+    });
+
+    // Sort by number of platforms available (most available first)
+    const sorted = Object.values(allRestaurants)
+      .sort((a, b) => b.platforms.length - a.platforms.length);
+
+    const result = {
+      found:       sorted.length > 0,
+      total:       sorted.length,
+      restaurants: sorted,
+    };
+
     setCached(cacheKey, result);
     res.json(result);
 
   } catch (err) {
-    console.error("Nearby error:", err);
+    console.error("Nearby-all error:", err);
     res.status(500).json({ error: err.message });
   } finally {
     if (browser) await browser.close();
@@ -347,15 +296,14 @@ app.get("/api/nearby", async (req, res) => {
 
 
 // ============================================================
-// POST /api/compare — Full price comparison with Maps lookup
+// POST /api/compare — Compare prices for a specific item
 // Body: { restaurantName, itemName, location, lat, lng }
 // ============================================================
 app.post("/api/compare", async (req, res) => {
   const { restaurantName, itemName = "", location = "Houston, TX", lat, lng } = req.body;
   if (!restaurantName) return res.status(400).json({ error: "restaurantName is required" });
 
-  const searchLocation = lat && lng ? `${lat},${lng}` : location;
-  const cacheKey = `${restaurantName}|${itemName}|${searchLocation}`;
+  const cacheKey = `compare|${restaurantName}|${itemName}|${lat}|${lng}`;
   const cached   = getCached(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
@@ -366,24 +314,86 @@ app.post("/api/compare", async (req, res) => {
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     });
 
-    // Step 1: Find nearby locations on Google Maps first
-    const nearbyPlaces = await searchGoogleMaps(browser, restaurantName, searchLocation);
-    console.log(`[Compare] Maps found: ${nearbyPlaces.map(p => p.name).join(", ")}`);
-
-    // Step 2: Use the closest Maps result name for more accurate platform searches
-    const refinedName = nearbyPlaces.length > 0 ? nearbyPlaces[0].name : restaurantName;
-
-    // Step 3: Scrape all 3 platforms simultaneously
     const [dd, ue, gh] = await Promise.all([
-      scrapeDoorDash(browser, refinedName, searchLocation),
-      scrapeUberEats(browser, refinedName, searchLocation),
-      scrapeGrubhub(refinedName, searchLocation),
+      getAllDoorDash(browser, lat || 29.76, lng || -95.36, restaurantName),
+      getAllUberEats(browser, lat || 29.76, lng || -95.36, restaurantName),
+      getAllGrubhub(lat || 29.76, lng || -95.36, restaurantName),
     ]);
 
+    // Find matching restaurants and get their menus
+    const norm    = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const tRest   = norm(restaurantName);
+    const matches = [];
+
+    for (const r of [...dd, ...ue, ...gh]) {
+      if (!norm(r.restaurant).includes(tRest)) continue;
+
+      // Fetch the menu for this specific restaurant
+      let menu = [];
+      if (r.orderUrl && (r.platform === "DoorDash" || r.platform === "Uber Eats")) {
+        menu = await getMenu(browser, r.platform, r.orderUrl, r.restaurant);
+      } else if (r.platform === "Grubhub") {
+        // Use Grubhub API for menu
+        const id = r.orderUrl?.split("/").pop();
+        if (id) {
+          try {
+            const mr   = await fetch(`https://api-gtm.grubhub.com/restaurants/${id}?hideHateos=true`, {
+              headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://www.grubhub.com/" }
+            });
+            const md   = await mr.json();
+            const list = md?.restaurant?.menu_item_list || [];
+            list.forEach(cat => {
+              (cat.choice_list || []).forEach(item => {
+                menu.push({ name: item.name, price: item.price ? item.price / 100 : null });
+              });
+            });
+          } catch (e) { console.error("[GH] menu error:", e.message); }
+        }
+      }
+
+      for (const item of menu) {
+        if (itemName && !norm(item.name).includes(norm(itemName))) continue;
+        const itemPrice = item.price  || 0;
+        const delFee    = r.deliveryFee || 0;
+        matches.push({
+          platform:      r.platform,
+          restaurant:    r.restaurant,
+          item:          item.name,
+          itemPrice,
+          deliveryFee:   delFee,
+          totalEstimate: Math.round((itemPrice + delFee) * 100) / 100,
+          deliveryTime:  r.deliveryTime,
+          rating:        r.rating,
+          orderUrl:      r.orderUrl,
+          appUrl:        r.appUrl,
+        });
+      }
+
+      if (menu.length === 0) {
+        matches.push({
+          platform:      r.platform,
+          restaurant:    r.restaurant,
+          item:          null,
+          itemPrice:     null,
+          deliveryFee:   r.deliveryFee || 0,
+          totalEstimate: r.deliveryFee || 0,
+          deliveryTime:  r.deliveryTime,
+          rating:        r.rating,
+          orderUrl:      r.orderUrl,
+          appUrl:        r.appUrl,
+        });
+      }
+    }
+
+    matches.sort((a, b) => a.totalEstimate - b.totalEstimate);
+
     const result = {
-      ...comparePrices(refinedName, itemName, [dd, ue, gh]),
-      nearbyPlaces,       // send Maps results to frontend too
-      refinedName,        // what name was actually searched
+      found:    matches.length > 0,
+      bestDeal: matches[0]?.platform,
+      savings:  matches.length > 1
+        ? Math.round((matches[matches.length-1].totalEstimate - matches[0].totalEstimate) * 100) / 100
+        : 0,
+      results: matches,
     };
 
     setCached(cacheKey, result);
@@ -391,33 +401,6 @@ app.post("/api/compare", async (req, res) => {
 
   } catch (err) {
     console.error("Compare error:", err);
-    res.status(500).json({ error: err.message });
-  } finally {
-    if (browser) await browser.close();
-  }
-});
-
-
-// ============================================================
-// GET /api/restaurants — Raw platform results
-// ============================================================
-app.get("/api/restaurants", async (req, res) => {
-  const { name, location = "Houston, TX" } = req.query;
-  if (!name) return res.status(400).json({ error: "name is required" });
-
-  let browser;
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    });
-    const [dd, ue, gh] = await Promise.all([
-      scrapeDoorDash(browser, name, location),
-      scrapeUberEats(browser, name, location),
-      scrapeGrubhub(name, location),
-    ]);
-    res.json({ doordash: dd, ubereats: ue, grubhub: gh });
-  } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
     if (browser) await browser.close();
